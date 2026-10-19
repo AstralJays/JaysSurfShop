@@ -45,20 +45,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - service: frontend
-            context: frontend
-          - service: chat-rag
-            context: services/chat-rag
-          - service: board-generator
-            context: services/board-generator
-    # On manual runs, skip matrix rows that were not selected.
-    if: >-
-      github.event_name != 'workflow_dispatch'
-      || inputs.service == 'all'
-      || inputs.service == matrix.service
+        # Job-level if cannot use matrix; select services here instead.
+        service: ${{ fromJSON(
+          (github.event_name != 'workflow_dispatch' || inputs.service == 'all')
+          && '["frontend","chat-rag","board-generator"]'
+          || format('["{0}"]', inputs.service)
+          ) }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve build context
+        id: ctx
+        run: |
+          case "${{ matrix.service }}" in
+            frontend)         echo "context=frontend" ;;
+            chat-rag)         echo "context=services/chat-rag" ;;
+            board-generator)  echo "context=services/board-generator" ;;
+            *) echo "::error::Unknown service: ${{ matrix.service }}"; exit 1 ;;
+          esac >> "$GITHUB_OUTPUT"
 
       - name: Check deploy role
         env:
@@ -87,7 +91,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./${{ matrix.context }}
+          context: ./${{ steps.ctx.outputs.context }}
           push: true
           tags: |
             ${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}/${{ matrix.service }}:${{ github.sha }}
