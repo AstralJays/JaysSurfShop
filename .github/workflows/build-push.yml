@@ -1,12 +1,32 @@
 name: Build and Push Images
 
-# Builds from repo Dockerfiles, pushes to ECR.
-# Upwind GitHub App detects registry push → dispatches shiftleft-automated scan.
+# Builds service images from Dockerfiles and pushes to ECR (git sha + latest).
+# Upwind GitHub App can scan on registry push; use upwind-scan.yml for
+# on-demand Shift Left image scans.
 
 on:
   workflow_dispatch:
+    inputs:
+      service:
+        description: Service to build and push
+        type: choice
+        options:
+          - all
+          - frontend
+          - chat-rag
+          - board-generator
+        default: all
   push:
     branches: [main]
+    paths:
+      - "frontend/**"
+      - "services/chat-rag/**"
+      - "services/board-generator/**"
+      - ".github/workflows/build-push.yml"
+
+concurrency:
+  group: build-push-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   AWS_REGION: us-east-1
@@ -21,6 +41,7 @@ jobs:
   build-push:
     name: Push ${{ matrix.service }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -31,8 +52,22 @@ jobs:
             context: services/chat-rag
           - service: board-generator
             context: services/board-generator
+    # On manual runs, skip matrix rows that were not selected.
+    if: >-
+      github.event_name != 'workflow_dispatch'
+      || inputs.service == 'all'
+      || inputs.service == matrix.service
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check deploy role
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_DEPLOY_ROLE_ARN" ]; then
+            echo "::error::Add AWS_DEPLOY_ROLE_ARN to this repo's Actions secrets."
+            exit 1
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -46,12 +81,16 @@ jobs:
         with:
           mask-password: true
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push
-        env:
-          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}/${{ matrix.service }}:${{ github.sha }}
-        run: |
-          docker build -t "$IMAGE" \
-            -t "${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}/${{ matrix.service }}:latest" \
-            "./${{ matrix.context }}"
-          docker push "$IMAGE"
-          docker push "${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}/${{ matrix.service }}:latest"
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.context }}
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}/${{ matrix.service }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}/${{ matrix.service }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

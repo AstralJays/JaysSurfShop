@@ -1,7 +1,7 @@
 name: Upwind Manual Image Scan
 
-# Manual SCA scan via Upwind Shift Left actions.
-# Requires GitHub secrets: UPWIND_CLIENT_ID, UPWIND_CLIENT_SECRET, AWS_ECR_PULL_ROLE_ARN
+# Build each service image on the runner and scan with Upwind Shift Left.
+# Secrets: UPWIND_CLIENT_ID, UPWIND_CLIENT_SECRET
 
 on:
   workflow_dispatch:
@@ -16,38 +16,45 @@ on:
           - board-generator
         default: all
       image_tag:
-        description: Image tag (ECR mode) or local tag suffix (build mode)
+        description: Local image tag suffix
         type: string
         default: latest
-      scan_mode:
-        description: Pull from ECR or build from Dockerfile on the runner
-        type: choice
-        options:
-          - ecr
-          - build
-        default: ecr
+      fail_on_scan_error:
+        description: Fail the job if the scan cannot complete
+        type: boolean
+        default: true
+      enforce_block_policy:
+        description: Fail when Upwind PR-block policy is violated
+        type: boolean
+        default: false
+
+concurrency:
+  group: upwind-scan-${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
-  AWS_REGION: us-east-1
   PROJECT_NAME: jays-surf-shop
   ENVIRONMENT: demo
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
   scan:
     name: Scan ${{ matrix.service }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        service: ${{ fromJSON(
-          inputs.service == 'all'
-          && '["frontend","chat-rag","board-generator"]'
-          || format('["{0}"]', inputs.service)
-          ) }}
+        include:
+          - service: frontend
+            context: frontend
+          - service: chat-rag
+            context: services/chat-rag
+          - service: board-generator
+            context: services/board-generator
+    if: inputs.service == 'all' || inputs.service == matrix.service
     steps:
       - name: Check Upwind credentials
         env:
@@ -61,74 +68,26 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Resolve build context
-        id: ctx
-        run: |
-          case "${{ matrix.service }}" in
-            frontend)         echo "context=frontend" ;;
-            chat-rag)         echo "context=services/chat-rag" ;;
-            board-generator)  echo "context=services/board-generator" ;;
-          esac >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Check AWS ECR pull role
-        if: inputs.scan_mode == 'ecr'
-        env:
-          AWS_ECR_PULL_ROLE_ARN: ${{ secrets.AWS_ECR_PULL_ROLE_ARN }}
-        run: |
-          if [ -z "$AWS_ECR_PULL_ROLE_ARN" ]; then
-            echo "::error::Add AWS_ECR_PULL_ROLE_ARN to this repo's Actions secrets."
-            echo "::error::Run: terraform output -raw github_actions_ecr_pull_role_arn (in infrastructure/ecs/terraform)"
-            exit 1
-          fi
-
-      - name: Configure AWS credentials
-        if: inputs.scan_mode == 'ecr'
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Build image
+        uses: docker/build-push-action@v6
         with:
-          role-to-assume: ${{ secrets.AWS_ECR_PULL_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        if: inputs.scan_mode == 'ecr'
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-        with:
-          mask-password: true
-
-      - name: Set image reference
-        id: image
-        run: |
-          if [ "${{ inputs.scan_mode }}" = "ecr" ]; then
-            IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}/${{ matrix.service }}:${{ inputs.image_tag }}"
-          else
-            IMAGE="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-${{ matrix.service }}:${{ inputs.image_tag }}"
-          fi
-          echo "ref=${IMAGE}" >> "$GITHUB_OUTPUT"
-          echo "Scan target: ${IMAGE}"
-
-      - name: Pull image from ECR
-        if: inputs.scan_mode == 'ecr'
-        run: docker pull "${{ steps.image.outputs.ref }}"
-
-      - name: Build image locally
-        if: inputs.scan_mode == 'build'
-        run: docker build -t "${{ steps.image.outputs.ref }}" "./${{ steps.ctx.outputs.context }}"
-
-      - name: Tag image for local-only scan
-        id: scan-image
-        run: |
-          LOCAL="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-${{ matrix.service }}:${{ inputs.image_tag }}"
-          docker tag "${{ steps.image.outputs.ref }}" "$LOCAL"
-          echo "ref=${LOCAL}" >> "$GITHUB_OUTPUT"
-          echo "Local scan tag: ${LOCAL}"
+          context: ./${{ matrix.context }}
+          load: true
+          tags: ${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-${{ matrix.service }}:${{ inputs.image_tag }}
+          cache-from: type=gha,scope=scan-${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=scan-${{ matrix.service }}
 
       - name: Shift Left Image Scan
         uses: upwindsecurity/shiftleft-create-image-scan-event-action@main
         with:
           upwind_client_id: ${{ secrets.UPWIND_CLIENT_ID }}
           upwind_client_secret: ${{ secrets.UPWIND_CLIENT_SECRET }}
-          docker_image: ${{ steps.scan-image.outputs.ref }}
+          docker_image: ${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-${{ matrix.service }}:${{ inputs.image_tag }}
           pull_image: false
           use_sudo: false
           commit_sha: ${{ github.sha }}
-          additional_registries: ${{ inputs.scan_mode == 'ecr' && format('{0}/{1}-{2}', steps.login-ecr.outputs.registry, env.PROJECT_NAME, env.ENVIRONMENT) || '' }}
+          fail_on_scan_error: ${{ inputs.fail_on_scan_error }}
+          enforce_block_policy: ${{ inputs.enforce_block_policy }}
